@@ -1,8 +1,3 @@
-variable "instance_count" {
-  description = "Number of instances to create"
-  type        = number
-}
-
 variable "name_prefix" {
   description = "Prefix for instance names"
   type        = string
