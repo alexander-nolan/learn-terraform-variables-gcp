@@ -84,6 +84,39 @@ module "cloud_router" {
   }]
 }
 
+# Create individual instances
+module "instances" {
+  source = "./modules/gcp-instance"
+
+  instance_count = var.instance_count
+  name_prefix    = "${var.project_name}-${var.environment}"
+  machine_type   = "e2-micro"
+  zone          = var.zone
+  network       = module.vpc.network_name
+  subnetwork    = module.vpc.subnets["${var.region}/private-subnet-0"].name
+  network_tags   = ["web-server", "allow-health-check"]
+  labels        = {
+    project     = var.project_name
+    environment = var.environment
+  }
+}
+
+# Create an unmanaged instance group for the load balancer
+resource "google_compute_instance_group" "webservers" {
+  name        = "webserver-group"
+  description = "Web server instance group"
+  zone        = var.zone
+  network     = module.vpc.network_self_link
+
+  instances = module.instances.instance_self_links
+
+  named_port {
+    name = "http"
+    port = 80
+  }
+}
+
+# Update the load balancer to use the unmanaged instance group
 module "lb" {
   source  = "GoogleCloudPlatform/lb-http/google"
   version = "~> 9.0"
@@ -125,7 +158,7 @@ module "lb" {
 
       groups = [
         {
-          group = module.mig.instance_group
+          group = google_compute_instance_group.webservers.self_link
         }
       ]
 
@@ -136,48 +169,6 @@ module "lb" {
       }
     }
   }
-}
-
-module "mig" {
-  source  = "terraform-google-modules/vm/google//modules/mig"
-  version = "~> 8.0"
-
-  project_id        = var.project_id
-  region           = var.region
-  target_size      = var.instance_count
-  hostname         = "web"
-  instance_template = module.instance_template.self_link
-
-  named_ports = [{
-    name = "http"
-    port = 80
-  }]
-}
-
-module "instance_template" {
-  source  = "terraform-google-modules/vm/google//modules/instance_template"
-  version = "~> 8.0"
-
-  project_id        = var.project_id
-  region           = var.region
-  subnetwork       = module.vpc.subnets["${var.region}/private-subnet-0"].self_link
-  service_account  = null
-
-  name_prefix    = "${var.project_name}-${var.environment}"
-  machine_type   = "e2-micro"
-  tags           = ["web-server", "allow-health-check"]
-
-  source_image         = "debian-11"
-  source_image_family  = "debian-11"
-  source_image_project = "debian-cloud"
-
-  startup_script = <<-EOF
-    #!/bin/bash
-    apt-get update
-    apt-get install -y apache2
-    systemctl start apache2
-    systemctl enable apache2
-  EOF
 }
 
 # Random string for unique names

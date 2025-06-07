@@ -21,12 +21,17 @@ output "load_balancer_ip" {
 }
 
 # Instance outputs
-output "instance_group" {
-  description = "The instance group URL"
-  value       = module.mig.instance_group
+output "instance_names" {
+  description = "Names of created instances"
+  value       = module.instances.instance_names
 }
 
-output "instance_template" {
-  description = "The self-link of the instance template"
-  value       = module.instance_template.self_link
+output "instance_self_links" {
+  description = "Self-links of created instances"
+  value       = module.instances.instance_self_links
+}
+
+output "instance_group" {
+  description = "The instance group self link"
+  value       = google_compute_instance_group.webservers.self_link
 }
