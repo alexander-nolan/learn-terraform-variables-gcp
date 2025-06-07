@@ -1,121 +1,190 @@
 terraform {
   required_providers {
-    aws = {
-      source = "hashicorp/aws"
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 4.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.1.0"
     }
   }
 }
 
-provider "aws" {
-  region  = "us-west-1"
-}
-
-data "aws_availability_zones" "available" {
-  state = "available"
+provider "google" {
+  project = var.project_id
+  region  = var.region
 }
 
 module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "2.64.0"
+  source  = "terraform-google-modules/network/google"
+  version = "~> 7.0"
 
-  cidr = "10.0.0.0/16"
+  project_id   = var.project_id
+  network_name = "${var.project_name}-${var.environment}"
+  routing_mode = "GLOBAL"
 
-  azs             = data.aws_availability_zones.available.names
-  private_subnets = ["10.0.101.0/24", "10.0.102.0/24"]
-  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
+  subnets = [
+    {
+      subnet_name   = "private-subnet-0"
+      subnet_ip     = var.private_subnet_cidr_blocks[0]
+      subnet_region = var.region
+    },
+    {
+      subnet_name   = "private-subnet-1"
+      subnet_ip     = var.private_subnet_cidr_blocks[1]
+      subnet_region = var.region
+    },
+    {
+      subnet_name   = "public-subnet-0"
+      subnet_ip     = var.public_subnet_cidr_blocks[0]
+      subnet_region = var.region
+    },
+    {
+      subnet_name   = "public-subnet-1"
+      subnet_ip     = var.public_subnet_cidr_blocks[1]
+      subnet_region = var.region
+    }
+  ]
 
-  enable_nat_gateway = true
-  enable_vpn_gateway = false
+  routes = [
+    {
+      name              = "egress-internet"
+      description       = "Route through IGW to access internet"
+      destination_range = "0.0.0.0/0"
+      next_hop_internet = "true"
+    }
+  ]
+}
 
-  tags = {
-    project     = "project-alpha",
-    environment = "dev"
+module "cloud_router" {
+  source  = "terraform-google-modules/cloud-router/google"
+  version = "~> 5.0"
+
+  name    = "nat-router"
+  project = var.project_id
+  region  = var.region
+  network = module.vpc.network_name
+
+  nats = [{
+    name                               = "nat-config"
+    source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+    subnetworks = [
+      {
+        name                     = module.vpc.subnets["${var.region}/private-subnet-0"].self_link
+        source_ip_ranges_to_nat  = ["ALL_IP_RANGES"]
+        secondary_ip_range_names = []
+      },
+      {
+        name                     = module.vpc.subnets["${var.region}/private-subnet-1"].self_link
+        source_ip_ranges_to_nat  = ["ALL_IP_RANGES"]
+        secondary_ip_range_names = []
+      }
+    ]
+  }]
+}
+
+module "lb" {
+  source  = "GoogleCloudPlatform/lb-http/google"
+  version = "~> 9.0"
+
+  project           = var.project_id
+  name              = "lb-${random_string.lb_id.result}"
+  target_tags       = ["allow-health-check"]
+  firewall_networks = [module.vpc.network_name]
+
+  backends = {
+    default = {
+      description                     = null
+      protocol                       = "HTTP"
+      port                           = 80
+      port_name                      = "http"
+      timeout_sec                    = 10
+      connection_draining_timeout_sec = null
+      enable_cdn                     = false
+      security_policy                = null
+      custom_request_headers         = null
+      custom_response_headers        = null
+      compression_mode               = null
+
+      health_check = {
+        check_interval_sec  = 10
+        timeout_sec         = 5
+        healthy_threshold   = 2
+        unhealthy_threshold = 3
+        request_path        = "/index.html"
+        port               = 80
+        host               = null
+        logging            = null
+      }
+
+      log_config = {
+        enable = false
+        sample_rate = null
+      }
+
+      groups = [
+        {
+          group = module.mig.instance_group
+        }
+      ]
+
+      iap_config = {
+        enable               = false
+        oauth2_client_id     = null
+        oauth2_client_secret = null
+      }
+    }
   }
 }
 
-module "app_security_group" {
-  source  = "terraform-aws-modules/security-group/aws//modules/web"
-  version = "3.17.0"
+module "mig" {
+  source  = "terraform-google-modules/vm/google//modules/mig"
+  version = "~> 8.0"
 
-  name        = "web-sg-project-alpha-dev"
-  description = "Security group for web-servers with HTTP ports open within VPC"
-  vpc_id      = module.vpc.vpc_id
+  project_id        = var.project_id
+  region           = var.region
+  target_size      = var.instance_count
+  hostname         = "web"
+  instance_template = module.instance_template.self_link
 
-  ingress_cidr_blocks = module.vpc.public_subnets_cidr_blocks
-
-  tags = {
-    project     = "project-alpha",
-    environment = "dev"
-  }
+  named_ports = [{
+    name = "http"
+    port = 80
+  }]
 }
 
-module "lb_security_group" {
-  source  = "terraform-aws-modules/security-group/aws//modules/web"
-  version = "3.17.0"
+module "instance_template" {
+  source  = "terraform-google-modules/vm/google//modules/instance_template"
+  version = "~> 8.0"
 
-  name        = "lb-sg-project-alpha-dev"
-  description = "Security group for load balancer with HTTP ports open within VPC"
-  vpc_id      = module.vpc.vpc_id
+  project_id        = var.project_id
+  region           = var.region
+  subnetwork       = module.vpc.subnets["${var.region}/private-subnet-0"].self_link
+  service_account  = null
 
-  ingress_cidr_blocks = ["0.0.0.0/0"]
+  name_prefix    = "${var.project_name}-${var.environment}"
+  machine_type   = "e2-micro"
+  tags           = ["web-server", "allow-health-check"]
 
-  tags = {
-    project     = "project-alpha",
-    environment = "dev"
-  }
+  source_image         = "debian-11"
+  source_image_family  = "debian-11"
+  source_image_project = "debian-cloud"
+
+  startup_script = <<-EOF
+    #!/bin/bash
+    apt-get update
+    apt-get install -y apache2
+    systemctl start apache2
+    systemctl enable apache2
+  EOF
 }
 
+# Random string for unique names
 resource "random_string" "lb_id" {
   length  = 3
   special = false
-}
-
-module "elb_http" {
-  source  = "terraform-aws-modules/elb/aws"
-  version = "2.4.0"
-
-  # Ensure load balancer name is unique
-  name = "lb-${random_string.lb_id.result}-project-alpha-dev"
-
-  internal = false
-
-  security_groups = [module.lb_security_group.this_security_group_id]
-  subnets         = module.vpc.public_subnets
-
-  number_of_instances = length(module.ec2_instances.instance_ids)
-  instances           = module.ec2_instances.instance_ids
-
-  listener = [{
-    instance_port     = "80"
-    instance_protocol = "HTTP"
-    lb_port           = "80"
-    lb_protocol       = "HTTP"
-  }]
-
-  health_check = {
-    target              = "HTTP:80/index.html"
-    interval            = 10
-    healthy_threshold   = 3
-    unhealthy_threshold = 10
-    timeout             = 5
-  }
-
-  tags = {
-    project     = "project-alpha",
-    environment = "dev"
-  }
-}
-
-module "ec2_instances" {
-  source = "./modules/aws-instance"
-
-  instance_count     = 2
-  instance_type      = "t2.micro"
-  subnet_ids         = module.vpc.private_subnets[*]
-  security_group_ids = [module.app_security_group.this_security_group_id]
-
-  tags = {
-    project     = "project-alpha",
-    environment = "dev"
-  }
+  lower   = true
+  upper   = false
+  numeric = true
 }
